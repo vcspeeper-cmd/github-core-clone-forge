@@ -15,8 +15,14 @@ function nowMs(): number {
   tick += 1;
   return BASE_MS + tick * 1000;
 }
+const isoCache = new Map<number, string>();
 function iso(ms: number): string {
-  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const hit = isoCache.get(ms);
+  if (hit !== undefined) return hit;
+  const text = new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (isoCache.size > 8192) isoCache.clear();
+  isoCache.set(ms, text);
+  return text;
 }
 
 // ---------------------------------------------------------------- git objects
@@ -195,6 +201,7 @@ interface Issue {
   createdAt: number;
   updatedAt: number;
   comments: Comment[];
+  rev?: number;
 }
 
 interface Comment {
@@ -288,6 +295,7 @@ function createRepo(name: string, options: { private?: boolean; description?: st
 // ---------------------------------------------------------------- HTTP plumbing
 
 const EMPTY_QUERY = new URLSearchParams('');
+const EMPTY_BODY = Buffer.alloc(0);
 
 interface Ctx {
   req: IncomingMessage;
@@ -412,6 +420,30 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     html_url: `/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+const issueBufCache = new WeakMap<Issue, { rev: number; buf: Buffer }>();
+
+function sendIssue(ctx: Ctx, status: number, repo: Repo, issue: Issue): void {
+  const rev = issue.rev ?? 0;
+  const hit = issueBufCache.get(issue);
+  if (hit !== undefined && hit.rev === rev) {
+    ctx.res.writeHead(status, {
+      'content-type': JSON_TYPE,
+      'content-length': String(hit.buf.length),
+      'x-github-request-id': ctx.requestId,
+    });
+    ctx.res.end(hit.buf);
+    return;
+  }
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBufCache.set(issue, { rev, buf });
+  ctx.res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': String(buf.length),
+    'x-github-request-id': ctx.requestId,
+  });
+  ctx.res.end(buf);
 }
 
 function commentJson(comment: Comment, repo: Repo, issue: Issue): Record<string, unknown> {
@@ -748,7 +780,7 @@ function issueRoute(ctx: Ctx, repo: Repo, numberText: string): void {
   const number = Number(numberText);
   const issue = repo.issues.find((entry) => entry.number === number);
   if (issue === undefined) return notFound(ctx);
-  if (ctx.method === 'GET') return send(ctx, 200, issueJson(repo, issue));
+  if (ctx.method === 'GET') return sendIssue(ctx, 200, repo, issue);
   if (ctx.method === 'PATCH') {
     const body = (ctx.json ?? {}) as Record<string, unknown>;
     if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
@@ -760,6 +792,7 @@ function issueRoute(ctx: Ctx, repo: Repo, numberText: string): void {
       issue.labels = labels;
     }
     issue.updatedAt = nowMs();
+    issue.rev = (issue.rev ?? 0) + 1;
     return send(ctx, 200, issueJson(repo, issue));
   }
   notFound(ctx);
@@ -776,6 +809,7 @@ function commentsRoute(ctx: Ctx, repo: Repo, numberText: string): void {
     repo.nextComment += 1;
     issue.comments.push(comment);
     issue.updatedAt = comment.createdAt;
+    issue.rev = (issue.rev ?? 0) + 1;
     return send(ctx, 201, commentJson(comment, repo, issue));
   }
   if (ctx.method === 'GET') {
@@ -2322,6 +2356,7 @@ function gqlFieldValue(kind: string, value: unknown, field: GqlFieldNode, variab
       }
       found.issue.state = 'closed';
       found.issue.updatedAt = nowMs();
+      found.issue.rev = (found.issue.rev ?? 0) + 1;
       return { kind: 'CloseIssuePayload', value: { issue: found.issue } };
     }
     if (name === 'createPullRequest') {
@@ -2380,6 +2415,7 @@ function gqlFieldValue(kind: string, value: unknown, field: GqlFieldNode, variab
       const comment: Comment = { id: found.repo.nextComment, body: String(input.body ?? ''), createdAt: nowMs() };
       found.repo.nextComment += 1;
       found.issue.comments.push(comment);
+      found.issue.rev = (found.issue.rev ?? 0) + 1;
       return { kind: 'AddCommentPayload', value: { comment } };
     }
     errors.push({ message: `Field '${name}' doesn't exist on type 'Mutation'` });
@@ -2687,7 +2723,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const mark = rawUrl.indexOf('?');
   const pathname = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
   const query = mark < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(mark + 1));
-  const body = await readBody(req);
+  const body = req.method === 'GET' || req.method === 'HEAD' ? EMPTY_BODY : await readBody(req);
   const ctx: Ctx = {
     req,
     res,
@@ -2702,7 +2738,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (ctx.path === '/healthz') {
     return send(ctx, 200, { ok: true });
   }
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(ctx.path);
+  const gitMatch = ctx.path.indexOf('.git') < 0 ? null : /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(ctx.path);
   if (gitMatch !== null) {
     const rest = (gitMatch[3] ?? '').replace(/^\//, '');
     const segments = rest.split('/').filter((part) => part !== '');
