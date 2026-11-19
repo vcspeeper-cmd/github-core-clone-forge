@@ -287,6 +287,8 @@ function createRepo(name: string, options: { private?: boolean; description?: st
 
 // ---------------------------------------------------------------- HTTP plumbing
 
+const EMPTY_QUERY = new URLSearchParams('');
+
 interface Ctx {
   req: IncomingMessage;
   res: ServerResponse;
@@ -306,14 +308,15 @@ function requestId(): string {
 
 function send(ctx: Ctx, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   const out: Record<string, string> = {
     'content-type': JSON_TYPE,
-    'content-length': String(Buffer.byteLength(text)),
+    'content-length': String(buf.length),
     'x-github-request-id': ctx.requestId,
     ...headers,
   };
   ctx.res.writeHead(status, out);
-  ctx.res.end(text);
+  ctx.res.end(buf);
 }
 
 function sendRaw(ctx: Ctx, status: number, body: Buffer, headers: Record<string, string> = {}): void {
@@ -1408,6 +1411,8 @@ function packEntryHeader(type: number, size: number): Buffer {
 
 const TYPE_NUMBER: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
+const deflated = new Map<string, Buffer>();
+
 function buildPack(repo: Repo, ids: readonly string[]): Buffer {
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -1418,7 +1423,12 @@ function buildPack(repo: Repo, ids: readonly string[]): Buffer {
     const obj = readObject(repo, id);
     if (obj === null) continue;
     chunks.push(packEntryHeader(TYPE_NUMBER[obj.type], obj.data.length));
-    chunks.push(deflateSync(obj.data));
+    let packed = deflated.get(id);
+    if (packed === undefined) {
+      packed = deflateSync(obj.data);
+      if (deflated.size < 20_000) deflated.set(id, packed);
+    }
+    chunks.push(packed);
   }
   const body = Buffer.concat(chunks);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -1426,35 +1436,8 @@ function buildPack(repo: Repo, ids: readonly string[]): Buffer {
 
 /** Inflate one zlib stream at `start`, returning the bytes and the first offset past it. */
 function inflateAt(buf: Buffer, start: number): { data: Buffer; end: number } {
-  let lo = start + 2;
-  let hi = buf.length;
-  let best: Buffer | null = null;
-  let bestEnd = hi;
-  // Grow a window until a full stream inflates, then binary-search the exact end.
-  let probe = Math.min(buf.length, start + 64);
-  for (;;) {
-    try {
-      best = inflateSync(buf.subarray(start, probe));
-      bestEnd = probe;
-      break;
-    } catch {
-      if (probe >= buf.length) throw new Error('truncated zlib stream in pack');
-      probe = Math.min(buf.length, probe * 2);
-    }
-  }
-  lo = start + 2;
-  hi = bestEnd;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      const data = inflateSync(buf.subarray(start, mid));
-      best = data;
-      hi = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return { data: best as Buffer, end: lo };
+  const result = inflateSync(buf.subarray(start), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+  return { data: result.buffer, end: start + result.engine.bytesWritten };
 }
 
 /** Read a packfile's plain objects (the client sends no deltas). */
@@ -2690,25 +2673,27 @@ function graphqlRoute(ctx: Ctx): void {
 // ---------------------------------------------------------------- the server
 
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void handle(req, res);
   });
+  server.keepAliveTimeout = 72_000;
+  server.headersTimeout = 75_000;
+  server.maxRequestsPerSocket = 0;
+  return server;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    url = new URL('http://entry/');
-  }
+  const rawUrl = req.url ?? '/';
+  const mark = rawUrl.indexOf('?');
+  const pathname = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
+  const query = mark < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(mark + 1));
   const body = await readBody(req);
   const ctx: Ctx = {
     req,
     res,
     method: req.method ?? 'GET',
-    path: url.pathname,
-    query: url.searchParams,
+    path: pathname,
+    query,
     token: tokenOf(req),
     body,
     json: undefined,
