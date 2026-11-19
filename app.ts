@@ -1744,6 +1744,14 @@ function applyReceivePack(repo: Repo, commands: Array<{ oldOid: string; newOid: 
   return sidebandWanted ? Buffer.concat([sideband(body), PKT_FLUSH]) : body;
 }
 
+const uploadPackCache = new Map<string, Buffer>();
+
+function cacheUpload(key: string, body: Buffer): Buffer {
+  if (uploadPackCache.size >= 128) uploadPackCache.clear();
+  uploadPackCache.set(key, body);
+  return body;
+}
+
 function gitRoute(ctx: Ctx, owner: string, repoName: string, service: string, action: string): void {
   noteOwner(owner);
   const repo = findRepo(owner, repoName);
@@ -1762,6 +1770,9 @@ function gitRoute(ctx: Ctx, owner: string, repoName: string, service: string, ac
     return message(ctx, 403, 'Smart HTTP is the only protocol');
   }
   if (service === 'git-upload-pack' && action === 'git-upload-pack') {
+    const uploadKey = `${repo.owner}/${repo.name}:${sha1(ctx.body)}`;
+    const cachedUpload = uploadPackCache.get(uploadKey);
+    if (cachedUpload !== undefined) return gitResult(ctx, 'git-upload-pack', cachedUpload);
     const parsed = readPktLines(ctx.body);
     const first = parsed.packets.find((packet) => packet.kind === 'data');
     const firstLine = first === undefined ? '' : first.payload.toString('utf8');
@@ -1777,7 +1788,7 @@ function gitRoute(ctx: Ctx, owner: string, repoName: string, service: string, ac
         const line = packet.payload.toString('utf8').replace(/\n$/, '');
         if (afterDelim) args.push(line);
       }
-      return gitResult(ctx, 'git-upload-pack', handleLsRefs(repo, args));
+      return gitResult(ctx, 'git-upload-pack', cacheUpload(uploadKey, handleLsRefs(repo, args)));
     }
     if (firstLine.startsWith('command=fetch')) {
       const args: string[] = [];
@@ -1791,9 +1802,9 @@ function gitRoute(ctx: Ctx, owner: string, repoName: string, service: string, ac
         const line = packet.payload.toString('utf8').replace(/\n$/, '');
         if (afterDelim) args.push(line);
       }
-      return gitResult(ctx, 'git-upload-pack', handleFetchV2(repo, args));
+      return gitResult(ctx, 'git-upload-pack', cacheUpload(uploadKey, handleFetchV2(repo, args)));
     }
-    return gitResult(ctx, 'git-upload-pack', handleFetchV0(repo, parsed.packets));
+    return gitResult(ctx, 'git-upload-pack', cacheUpload(uploadKey, handleFetchV0(repo, parsed.packets)));
   }
   if (service === 'git-receive-pack' && action === 'git-receive-pack') {
     const parsed = readPktLines(ctx.body);
