@@ -239,6 +239,8 @@ interface Repo {
 
 const repos = new Map<string, Repo>();
 let nextRepoId = 1000;
+let nextIssueId = 10_000;
+let nextPullId = 30_000;
 let viewerLogin = '';
 let otherLoginSeen = '';
 
@@ -709,7 +711,7 @@ function issuesRoute(ctx: Ctx, repo: Repo): void {
     }
     const stamp = nowMs();
     const issue: Issue = {
-      id: 10_000 + repo.nextIssue,
+      id: nextIssueId++,
       number: repo.nextIssue,
       title,
       body: text,
@@ -821,7 +823,7 @@ function pullsRoute(ctx: Ctx, repo: Repo): void {
     if (headSha === undefined) return message(ctx, 422, `Validation Failed: head ${headRef} does not exist`);
     if (baseSha === undefined) return message(ctx, 422, `Validation Failed: base ${baseRef} does not exist`);
     const pull: Pull = {
-      id: 30_000 + repo.nextPull,
+      id: nextPullId++,
       number: repo.nextPull,
       title: typeof body.title === 'string' ? body.title : '',
       body: typeof body.body === 'string' ? body.body : '',
@@ -1144,7 +1146,7 @@ function callTool(name: string, args: Record<string, unknown>): { result?: Recor
       if (headSha === undefined) return { error: { code: -32602, message: `head branch ${head} does not exist` } };
       if (baseSha === undefined) return { error: { code: -32602, message: `base branch ${base} does not exist` } };
       const pull: Pull = {
-        id: 30_000 + repo.nextPull,
+        id: nextPullId++,
         number: repo.nextPull,
         title: argString(args, 'title'),
         body: argString(args, 'body'),
@@ -1802,6 +1804,889 @@ function gitRoute(ctx: Ctx, owner: string, repoName: string, service: string, ac
   message(ctx, 404, 'Not Found');
 }
 
+// ---------------------------------------------------------------- GraphQL v4
+
+interface GqlFieldNode {
+  alias: string | null;
+  name: string;
+  args: Record<string, unknown>;
+  selections: GqlSelectionNode[];
+}
+interface GqlInlineNode {
+  typeCondition: string | null;
+  selections: GqlSelectionNode[];
+}
+type GqlSelectionNode = { field: GqlFieldNode } | { inline: GqlInlineNode };
+
+interface GqlOperation {
+  kind: 'query' | 'mutation';
+  name: string | null;
+  variables: Array<{ name: string; type: string }>;
+  selections: GqlSelectionNode[];
+}
+
+interface GqlErrorEntry {
+  message: string;
+  path?: Array<string | number>;
+}
+
+class GqlSyntaxError extends Error {}
+
+const GQL_PUNCT = '{}()[]:=!$@|&';
+
+function gqlTokenize(src: string): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === ',') {
+      i += 1;
+      continue;
+    }
+    if (ch === '#') {
+      while (i < src.length && src[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      if (src.startsWith('"""', i)) {
+        const end = src.indexOf('"""', i + 3);
+        const stop = end < 0 ? src.length : end;
+        tokens.push(`S:${src.slice(i + 3, stop)}`);
+        i = stop + 3;
+        continue;
+      }
+      let j = i + 1;
+      let out = '';
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === '\\' && j + 1 < src.length) {
+          const esc = src[j + 1];
+          if (esc === 'n') out += '\n';
+          else if (esc === 't') out += '\t';
+          else if (esc === 'r') out += '\r';
+          else if (esc === 'u' && j + 5 < src.length) {
+            out += String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16));
+            j += 4;
+          } else out += esc;
+          j += 2;
+          continue;
+        }
+        out += src[j];
+        j += 1;
+      }
+      tokens.push(`S:${out}`);
+      i = j + 1;
+      continue;
+    }
+    if (src.startsWith('...', i)) {
+      tokens.push('...');
+      i += 3;
+      continue;
+    }
+    if (GQL_PUNCT.includes(ch)) {
+      tokens.push(ch);
+      i += 1;
+      continue;
+    }
+    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      let j = i + 1;
+      while (j < src.length && /[0-9.eE+-]/.test(src[j])) j += 1;
+      tokens.push(`N:${src.slice(i, j)}`);
+      i = j;
+      continue;
+    }
+    if (/[_A-Za-z]/.test(ch)) {
+      let j = i + 1;
+      while (j < src.length && /[_0-9A-Za-z]/.test(src[j])) j += 1;
+      tokens.push(`A:${src.slice(i, j)}`);
+      i = j;
+      continue;
+    }
+    throw new GqlSyntaxError(`unexpected character ${JSON.stringify(ch)}`);
+  }
+  return tokens;
+}
+
+class GqlParser {
+  private pos = 0;
+  private readonly tokens: string[];
+
+  constructor(tokens: string[]) {
+    this.tokens = tokens;
+  }
+
+  private peek(): string | undefined {
+    return this.tokens[this.pos];
+  }
+
+  private next(): string {
+    const tok = this.tokens[this.pos];
+    if (tok === undefined) throw new GqlSyntaxError('unexpected end of document');
+    this.pos += 1;
+    return tok;
+  }
+
+  private expect(tok: string): void {
+    const got = this.next();
+    if (got !== tok) throw new GqlSyntaxError(`expected ${tok}, got ${got}`);
+  }
+
+  private isName(tok: string | undefined): boolean {
+    return tok !== undefined && tok.startsWith('A:');
+  }
+
+  private nameValue(tok: string): string {
+    return tok.slice(2);
+  }
+
+  parseDocument(): GqlOperation[] {
+    const operations: GqlOperation[] = [];
+    while (this.pos < this.tokens.length) {
+      operations.push(this.parseOperation());
+    }
+    if (operations.length === 0) throw new GqlSyntaxError('empty document');
+    return operations;
+  }
+
+  private parseOperation(): GqlOperation {
+    let kind: 'query' | 'mutation' = 'query';
+    const first = this.peek();
+    if (first !== undefined && (first === 'A:query' || first === 'A:mutation')) {
+      kind = this.nameValue(this.next()) as 'query' | 'mutation';
+    }
+    let name: string | null = null;
+    if (this.isName(this.peek())) name = this.nameValue(this.next());
+    const variables: Array<{ name: string; type: string }> = [];
+    if (this.peek() === '(') {
+      this.next();
+      while (this.peek() !== ')') {
+        this.expect('$');
+        const varName = this.nameValue(this.next());
+        this.expect(':');
+        const type = this.parseType();
+        if (this.peek() === '=') {
+          this.next();
+          this.parseValue();
+        }
+        variables.push({ name: varName, type });
+      }
+      this.expect(')');
+    }
+    this.skipDirectives();
+    const selections = this.parseSelectionSet();
+    return { kind, name, variables, selections };
+  }
+
+  private parseType(): string {
+    const tok = this.next();
+    if (tok === '[') {
+      const inner = this.parseType();
+      this.expect(']');
+      let out = `[${inner}]`;
+      if (this.peek() === '!') {
+        this.next();
+        out += '!';
+      }
+      return out;
+    }
+    let out = this.nameValue(tok);
+    if (this.peek() === '!') {
+      this.next();
+      out += '!';
+    }
+    return out;
+  }
+
+  private skipDirectives(): void {
+    while (this.peek() === '@') {
+      this.next();
+      this.next();
+      if (this.peek() === '(') {
+        this.next();
+        let depth = 1;
+        while (depth > 0) {
+          const tok = this.next();
+          if (tok === '(') depth += 1;
+          else if (tok === ')') depth -= 1;
+        }
+      }
+    }
+  }
+
+  private parseSelectionSet(): GqlSelectionNode[] {
+    this.expect('{');
+    const selections: GqlSelectionNode[] = [];
+    while (this.peek() !== '}') {
+      if (this.peek() === '...') {
+        this.next();
+        let typeCondition: string | null = null;
+        if (this.peek() === 'A:on') {
+          this.next();
+          typeCondition = this.nameValue(this.next());
+        }
+        this.skipDirectives();
+        selections.push({ inline: { typeCondition, selections: this.parseSelectionSet() } });
+        continue;
+      }
+      let name = this.nameValue(this.next());
+      let alias: string | null = null;
+      if (this.peek() === ':') {
+        this.next();
+        alias = name;
+        name = this.nameValue(this.next());
+      }
+      const args: Record<string, unknown> = {};
+      if (this.peek() === '(') {
+        this.next();
+        while (this.peek() !== ')') {
+          const argName = this.nameValue(this.next());
+          this.expect(':');
+          args[argName] = this.parseValue();
+        }
+        this.expect(')');
+      }
+      this.skipDirectives();
+      const children = this.peek() === '{' ? this.parseSelectionSet() : [];
+      selections.push({ field: { alias, name, args, selections: children } });
+      continue;
+    }
+    this.expect('}');
+    return selections;
+  }
+
+  private parseValue(): unknown {
+    const tok = this.next();
+    if (tok === '$') return { var: this.nameValue(this.next()) };
+    if (tok === '[') {
+      const list: unknown[] = [];
+      while (this.peek() !== ']') list.push(this.parseValue());
+      this.expect(']');
+      return list;
+    }
+    if (tok === '{') {
+      const obj: Record<string, unknown> = {};
+      while (this.peek() !== '}') {
+        const key = this.nameValue(this.next());
+        this.expect(':');
+        obj[key] = this.parseValue();
+      }
+      this.expect('}');
+      return obj;
+    }
+    if (tok.startsWith('N:')) return Number(tok.slice(2));
+    if (tok.startsWith('S:')) return tok.slice(2);
+    if (tok.startsWith('A:')) {
+      const word = tok.slice(2);
+      if (word === 'true') return true;
+      if (word === 'false') return false;
+      if (word === 'null') return null;
+      return { enum: word };
+    }
+    throw new GqlSyntaxError(`unexpected value token ${tok}`);
+  }
+}
+
+function gqlResolveValue(value: unknown, variables: Record<string, unknown>): unknown {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (typeof record.var === 'string') return variables[record.var];
+    if (typeof record.enum === 'string') return record.enum;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(record)) out[key] = gqlResolveValue(entry, variables);
+    return out;
+  }
+  if (Array.isArray(value)) return value.map((entry) => gqlResolveValue(entry, variables));
+  return value;
+}
+
+function gqlArgs(field: GqlFieldNode, variables: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(field.args)) out[key] = gqlResolveValue(value, variables);
+  return out;
+}
+
+function gid(type: string, id: number | string): string {
+  return Buffer.from(`${type}:${id}`, 'utf8').toString('base64');
+}
+
+function ungid(value: string): { type: string; id: string } | null {
+  try {
+    const text = Buffer.from(value, 'base64').toString('utf8');
+    const at = text.indexOf(':');
+    if (at <= 0) return null;
+    return { type: text.slice(0, at), id: text.slice(at + 1) };
+  } catch {
+    return null;
+  }
+}
+
+interface GqlResolved {
+  kind: string;
+  value: unknown;
+}
+
+type GqlOut = GqlResolved | GqlOut[] | string | number | boolean | null;
+
+function gqlSelect(kind: string, value: unknown, selections: readonly GqlSelectionNode[], variables: Record<string, unknown>, errors: GqlErrorEntry[]): Record<string, unknown> | null {
+  if (value === null || value === undefined) return null;
+  const out: Record<string, unknown> = {};
+  for (const selection of selections) {
+    if ('inline' in selection) {
+      const condition = selection.inline.typeCondition;
+      if (condition !== null && condition !== kind) continue;
+      const merged = gqlSelect(kind, value, selection.inline.selections, variables, errors);
+      if (merged !== null) Object.assign(out, merged);
+      continue;
+    }
+    const field = selection.field;
+    const key = field.alias ?? field.name;
+    const resolved = gqlFieldValue(kind, value, field, variables, errors);
+    out[key] = resolved === undefined ? null : gqlFinish(resolved, field.selections, variables, errors);
+  }
+  return out;
+}
+
+function gqlFinish(resolved: GqlOut, selections: readonly GqlSelectionNode[], variables: Record<string, unknown>, errors: GqlErrorEntry[]): unknown {
+  if (Array.isArray(resolved)) return resolved.map((entry) => gqlFinish(entry, selections, variables, errors));
+  if (resolved !== null && typeof resolved === 'object' && 'kind' in resolved) {
+    if (selections.length === 0) return resolved.value;
+    return gqlSelect(resolved.kind, resolved.value, selections, variables, errors);
+  }
+  return resolved;
+}
+
+const GQL_SCHEMA: Record<string, string[]> = {
+  Issue: ['id', 'number', 'title', 'state', 'body', 'author', 'createdAt', 'updatedAt', 'comments', 'labels', 'closed'],
+  PullRequest: ['id', 'number', 'title', 'state', 'merged', 'mergeable', 'headRefName', 'baseRefName', 'files', 'body', 'createdAt', 'updatedAt', 'isDraft', 'additions', 'deletions', 'changedFiles'],
+  Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest', 'isPrivate', 'description', 'createdAt', 'url'],
+  User: ['login', 'id', 'name', 'email'],
+  SearchType: [],
+};
+
+const GQL_ENUMS: Record<string, string[]> = {
+  SearchType: ['ISSUE', 'ISSUE_ADVANCED', 'REPOSITORY', 'USER', 'DISCUSSION'],
+  IssueState: ['OPEN', 'CLOSED'],
+  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
+  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
+  PullRequestMergeMethod: ['MERGE', 'SQUASH', 'REBASE'],
+  RepositoryPermission: ['ADMIN', 'MAINTAIN', 'WRITE', 'TRIAGE', 'READ'],
+  IssueOrderField: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'],
+  OrderDirection: ['ASC', 'DESC'],
+};
+
+function gqlFindRepoById(id: number): Repo | null {
+  for (const repo of repos.values()) if (repo.id === id) return repo;
+  return null;
+}
+
+function gqlFindRepoByName(owner: string, name: string): Repo | null {
+  if (viewerLogin !== '' && owner.toLowerCase() !== viewerLogin.toLowerCase()) return null;
+  return repos.get(repoKey(owner, name)) ?? null;
+}
+
+function gqlFindIssueById(id: number): { repo: Repo; issue: Issue } | null {
+  for (const repo of repos.values()) {
+    for (const issue of repo.issues) if (issue.id === id) return { repo, issue };
+  }
+  return null;
+}
+
+function gqlFindPullById(id: number): { repo: Repo; pull: Pull } | null {
+  for (const repo of repos.values()) {
+    for (const pull of repo.pulls) if (pull.id === id) return { repo, pull };
+  }
+  return null;
+}
+
+function gqlTreePaths(repo: Repo, commitSha: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const commit = readObject(repo, commitSha);
+  if (commit === null || commit.type !== 'commit') return out;
+  const treeSha = parseCommit(commit.data).tree;
+  const walk = (sha: string, prefix: string): void => {
+    const obj = readObject(repo, sha);
+    if (obj === null || obj.type !== 'tree') return;
+    for (const entry of parseTree(obj.data)) {
+      const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.mode === '40000') walk(entry.sha, path);
+      else out.set(path, entry.sha);
+    }
+  };
+  walk(treeSha, '');
+  return out;
+}
+
+function gqlChangedPaths(repo: Repo, baseSha: string, headSha: string): string[] {
+  const base = gqlTreePaths(repo, baseSha);
+  const head = gqlTreePaths(repo, headSha);
+  const out: string[] = [];
+  for (const [path, sha] of head) if (base.get(path) !== sha) out.push(path);
+  for (const path of base.keys()) if (!head.has(path)) out.push(path);
+  return out.sort();
+}
+
+function gqlIssueState(issue: Issue): string {
+  return issue.state === 'closed' ? 'CLOSED' : 'OPEN';
+}
+
+function gqlPullState(pull: Pull): string {
+  if (pull.merged) return 'MERGED';
+  return pull.state === 'closed' ? 'CLOSED' : 'OPEN';
+}
+
+function gqlIssuesConnection(repo: Repo, args: Record<string, unknown>): Record<string, unknown> {
+  const states = Array.isArray(args.states) ? (args.states as unknown[]).map((entry) => String(entry)) : null;
+  const first = typeof args.first === 'number' ? args.first : 30;
+  const after = typeof args.after === 'string' ? args.after : null;
+  let list = [...repo.issues];
+  if (states !== null && states.length > 0) {
+    list = list.filter((issue) => states.includes(gqlIssueState(issue)));
+  }
+  list.sort((a, b) => b.number - a.number);
+  let start = 0;
+  if (after !== null) {
+    const decoded = ungid(after);
+    const cursor = decoded === null ? Number.NaN : Number(decoded.id);
+    const index = list.findIndex((issue) => issue.number === cursor);
+    start = index < 0 ? list.length : index + 1;
+  }
+  const page = list.slice(start, start + Math.max(0, first));
+  const hasNextPage = start + page.length < list.length;
+  const last = page[page.length - 1];
+  return {
+    __kind: 'IssueConnection',
+    nodes: page,
+    pageInfo: {
+      __kind: 'PageInfo',
+      hasNextPage,
+      endCursor: last === undefined ? null : gid('IssueCursor', last.number),
+    },
+  };
+}
+
+function gqlPullRequestsConnection(repo: Repo, args: Record<string, unknown>): Record<string, unknown> {
+  const first = typeof args.first === 'number' ? args.first : 30;
+  const list = [...repo.pulls].filter((pull) => !pull.merged && pull.state === 'open').sort((a, b) => b.number - a.number);
+  return { __kind: 'PullRequestConnection', nodes: list.slice(0, Math.max(0, first)) };
+}
+
+function gqlFieldValue(kind: string, value: unknown, field: GqlFieldNode, variables: Record<string, unknown>, errors: GqlErrorEntry[]): GqlOut | undefined {
+  const args = gqlArgs(field, variables);
+  const name = field.name;
+
+  if (kind === 'Query') {
+    if (name === 'viewer') return { kind: 'User', value: { login: viewerLogin } };
+    if (name === 'repository') {
+      const repo = gqlFindRepoByName(String(args.owner ?? ''), String(args.name ?? ''));
+      return repo === null ? null : { kind: 'Repository', value: repo };
+    }
+    if (name === 'node') {
+      const decoded = ungid(String(args.id ?? ''));
+      if (decoded === null) return null;
+      if (decoded.type === 'Repository') {
+        const repo = gqlFindRepoById(Number(decoded.id));
+        return repo === null ? null : { kind: 'Repository', value: repo };
+      }
+      if (decoded.type === 'Issue') {
+        const found = gqlFindIssueById(Number(decoded.id));
+        return found === null ? null : { kind: 'Issue', value: found.issue };
+      }
+      if (decoded.type === 'PullRequest') {
+        const found = gqlFindPullById(Number(decoded.id));
+        return found === null ? null : { kind: 'PullRequest', value: found.pull };
+      }
+      return null;
+    }
+    if (name === '__type') {
+      const typeName = String(args.name ?? '');
+      if (!(typeName in GQL_SCHEMA) && !(typeName in GQL_ENUMS)) return null;
+      return { kind: '__Type', value: { typeName } };
+    }
+    if (name === '__typename') return kind;
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Query'` });
+    return null;
+  }
+
+  if (kind === 'Mutation') {
+    if (name === '__typename') return kind;
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    if (name === 'createIssue') {
+      const repo = gqlFindRepoById(Number(ungid(String(input.repositoryId ?? ''))?.id ?? Number.NaN));
+      if (repo === null) {
+        errors.push({ message: 'Could not resolve to a Repository with the global id' });
+        return null;
+      }
+      const issue: Issue = {
+        id: nextIssueId++,
+        number: repo.nextIssue,
+        title: String(input.title ?? ''),
+        body: String(input.body ?? ''),
+        state: 'open',
+        labels: [],
+        createdAt: nowMs(),
+        updatedAt: nowMs(),
+        comments: [],
+      };
+      repo.nextIssue += 1;
+      repo.issues.push(issue);
+      return { kind: 'CreateIssuePayload', value: { issue } };
+    }
+    if (name === 'closeIssue') {
+      const decoded = ungid(String(input.issueId ?? ''));
+      const found = decoded === null ? null : gqlFindIssueById(Number(decoded.id));
+      if (found === null) {
+        errors.push({ message: 'Could not resolve to an Issue with the global id' });
+        return null;
+      }
+      found.issue.state = 'closed';
+      found.issue.updatedAt = nowMs();
+      return { kind: 'CloseIssuePayload', value: { issue: found.issue } };
+    }
+    if (name === 'createPullRequest') {
+      const repo = gqlFindRepoById(Number(ungid(String(input.repositoryId ?? ''))?.id ?? Number.NaN));
+      if (repo === null) {
+        errors.push({ message: 'Could not resolve to a Repository with the global id' });
+        return null;
+      }
+      const headRef = String(input.headRefName ?? '');
+      const baseRef = String(input.baseRefName ?? '');
+      const headSha = repo.refs.get(`refs/heads/${headRef}`);
+      const baseSha = repo.refs.get(`refs/heads/${baseRef}`);
+      if (headSha === undefined || baseSha === undefined) {
+        errors.push({ message: 'Base or head branch does not exist' });
+        return null;
+      }
+      const pull: Pull = {
+        id: 30_000 + repo.nextPull,
+        number: repo.nextPull,
+        title: String(input.title ?? ''),
+        body: String(input.body ?? ''),
+        state: 'open',
+        headRef,
+        headSha,
+        baseRef,
+        baseSha,
+        merged: false,
+        mergedAt: null,
+        mergeCommitSha: null,
+        createdAt: nowMs(),
+      };
+      repo.nextPull += 1;
+      repo.pulls.push(pull);
+      return { kind: 'CreatePullRequestPayload', value: { pullRequest: pull } };
+    }
+    if (name === 'mergePullRequest') {
+      const decoded = ungid(String(input.pullRequestId ?? ''));
+      const found = decoded === null ? null : gqlFindPullById(Number(decoded.id));
+      if (found === null) {
+        errors.push({ message: 'Could not resolve to a PullRequest with the global id' });
+        return null;
+      }
+      found.pull.merged = true;
+      found.pull.state = 'closed';
+      found.pull.mergedAt = iso(nowMs());
+      found.pull.mergeCommitSha = found.pull.headSha;
+      return { kind: 'MergePullRequestPayload', value: { pullRequest: found.pull } };
+    }
+    if (name === 'addComment') {
+      const decoded = ungid(String(input.subjectId ?? ''));
+      const found = decoded === null ? null : gqlFindIssueById(Number(decoded.id));
+      if (found === null) {
+        errors.push({ message: 'Could not resolve to an Issue with the global id' });
+        return null;
+      }
+      const comment: Comment = { id: found.repo.nextComment, body: String(input.body ?? ''), createdAt: nowMs() };
+      found.repo.nextComment += 1;
+      found.issue.comments.push(comment);
+      return { kind: 'AddCommentPayload', value: { comment } };
+    }
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Mutation'` });
+    return null;
+  }
+
+  if (kind === 'Repository') {
+    const repo = value as Repo;
+    if (name === '__typename') return kind;
+    if (name === 'id') return gid('Repository', repo.id);
+    if (name === 'databaseId') return repo.id;
+    if (name === 'name') return repo.name;
+    if (name === 'nameWithOwner') return `${repo.owner}/${repo.name}`;
+    if (name === 'owner') return { kind: 'User', value: { login: repo.owner } };
+    if (name === 'defaultBranchRef') {
+      const sha = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
+      if (sha === undefined) return null;
+      return { kind: 'Ref', value: { name: repo.defaultBranch, sha } };
+    }
+    if (name === 'viewerPermission') return 'ADMIN';
+    if (name === 'hasIssuesEnabled') return true;
+    if (name === 'isPrivate') return repo.private;
+    if (name === 'description') return repo.description;
+    if (name === 'createdAt') return iso(repo.createdAt);
+    if (name === 'url') return `/${repo.owner}/${repo.name}`;
+    if (name === 'issue') {
+      const number = Number(args.number ?? Number.NaN);
+      const issue = repo.issues.find((entry) => entry.number === number);
+      return issue === undefined ? null : { kind: 'Issue', value: issue };
+    }
+    if (name === 'issues') return { kind: 'IssueConnection', value: gqlIssuesConnection(repo, args) };
+    if (name === 'pullRequests') return { kind: 'PullRequestConnection', value: gqlPullRequestsConnection(repo, args) };
+    if (name === 'pullRequest') {
+      const number = Number(args.number ?? Number.NaN);
+      const pull = repo.pulls.find((entry) => entry.number === number);
+      return pull === undefined ? null : { kind: 'PullRequest', value: pull };
+    }
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Repository'` });
+    return null;
+  }
+
+  if (kind === 'Ref') {
+    const ref = value as { name: string; sha: string };
+    if (name === '__typename') return kind;
+    if (name === 'name') return ref.name;
+    if (name === 'target') return { kind: 'Commit', value: { sha: ref.sha } };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Ref'` });
+    return null;
+  }
+
+  if (kind === 'Commit') {
+    const commit = value as { sha: string };
+    if (name === '__typename') return kind;
+    if (name === 'oid') return commit.sha;
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Commit'` });
+    return null;
+  }
+
+  if (kind === 'Issue') {
+    const issue = value as Issue;
+    if (name === '__typename') return kind;
+    if (name === 'id') return gid('Issue', issue.id);
+    if (name === 'number') return issue.number;
+    if (name === 'title') return issue.title;
+    if (name === 'body') return issue.body;
+    if (name === 'state') return gqlIssueState(issue);
+    if (name === 'createdAt') return iso(issue.createdAt);
+    if (name === 'updatedAt') return iso(issue.updatedAt);
+    if (name === 'closed') return issue.state === 'closed';
+    if (name === 'labels') return { kind: 'LabelConnection', value: { nodes: issue.labels.map((label) => ({ name: label })) } };
+    if (name === 'comments') return { kind: 'IssueCommentConnection', value: { nodes: issue.comments } };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Issue'` });
+    return null;
+  }
+
+  if (kind === 'PullRequest') {
+    const pull = value as Pull;
+    if (name === '__typename') return kind;
+    if (name === 'id') return gid('PullRequest', pull.id);
+    if (name === 'number') return pull.number;
+    if (name === 'title') return pull.title;
+    if (name === 'body') return pull.body;
+    if (name === 'state') return gqlPullState(pull);
+    if (name === 'merged') return pull.merged;
+    if (name === 'mergeable') return 'MERGEABLE';
+    if (name === 'headRefName') return pull.headRef;
+    if (name === 'baseRefName') return pull.baseRef;
+    if (name === 'createdAt') return iso(pull.createdAt);
+    if (name === 'updatedAt') return iso(pull.createdAt);
+    if (name === 'isDraft') return false;
+    if (name === 'files') {
+      const found = gqlFindPullById(pull.id);
+      const repo = found === null ? null : found.repo;
+      const paths = repo === null ? [] : gqlChangedPaths(repo, pull.baseSha, pull.headSha);
+
+      const first = typeof args.first === 'number' ? args.first : paths.length;
+      return { kind: 'PullRequestChangedFileConnection', value: { nodes: paths.slice(0, Math.max(0, first)).map((path) => ({ path })) } };
+    }
+    errors.push({ message: `Field '${name}' doesn't exist on type 'PullRequest'` });
+    return null;
+  }
+
+  if (kind === 'User') {
+    const user = value as { login: string };
+    if (name === '__typename') return kind;
+    if (name === 'login') return user.login;
+    if (name === 'id') return gid('User', user.login);
+    if (name === 'name') return user.login;
+    if (name === 'email') return '';
+    errors.push({ message: `Field '${name}' doesn't exist on type 'User'` });
+    return null;
+  }
+
+  if (kind === 'IssueConnection' || kind === 'PullRequestConnection' || kind === 'PullRequestChangedFileConnection' || kind === 'LabelConnection' || kind === 'IssueCommentConnection') {
+    const connection = value as { nodes: unknown[]; pageInfo?: unknown };
+    if (name === '__typename') return kind;
+    if (name === 'nodes') {
+      const childKind =
+        kind === 'IssueConnection'
+          ? 'Issue'
+          : kind === 'PullRequestConnection'
+            ? 'PullRequest'
+            : kind === 'PullRequestChangedFileConnection'
+              ? 'PullRequestChangedFile'
+              : kind === 'LabelConnection'
+                ? 'Label'
+                : 'IssueComment';
+      return (connection.nodes as unknown[]).map((node) => ({ kind: childKind, value: node }));
+    }
+    if (name === 'pageInfo') return { kind: 'PageInfo', value: connection.pageInfo ?? { hasNextPage: false, endCursor: null } };
+    if (name === 'totalCount') return (connection.nodes as unknown[]).length;
+    errors.push({ message: `Field '${name}' doesn't exist on type '${kind}'` });
+    return null;
+  }
+
+  if (kind === 'PageInfo') {
+    const info = value as { hasNextPage: boolean; endCursor: string | null };
+    if (name === '__typename') return kind;
+    if (name === 'hasNextPage') return info.hasNextPage;
+    if (name === 'endCursor') return info.endCursor;
+    if (name === 'startCursor') return info.endCursor;
+    errors.push({ message: `Field '${name}' doesn't exist on type 'PageInfo'` });
+    return null;
+  }
+
+  if (kind === 'PullRequestChangedFile') {
+    const file = value as { path: string };
+    if (name === '__typename') return kind;
+    if (name === 'path') return file.path;
+    errors.push({ message: `Field '${name}' doesn't exist on type 'PullRequestChangedFile'` });
+    return null;
+  }
+
+  if (kind === 'Label') {
+    const label = value as { name: string };
+    if (name === '__typename') return kind;
+    if (name === 'name') return label.name;
+    errors.push({ message: `Field '${name}' doesn't exist on type 'Label'` });
+    return null;
+  }
+
+  if (kind === 'IssueComment') {
+    const comment = value as Comment;
+    if (name === '__typename') return kind;
+    if (name === 'id') return gid('IssueComment', comment.id);
+    if (name === 'body') return comment.body;
+    if (name === 'createdAt') return iso(comment.createdAt);
+    errors.push({ message: `Field '${name}' doesn't exist on type 'IssueComment'` });
+    return null;
+  }
+
+  if (kind === '__Type') {
+    const type = value as { typeName: string };
+    if (name === '__typename') return kind;
+    if (name === 'name') return type.typeName;
+    if (name === 'kind') return type.typeName in GQL_ENUMS ? 'ENUM' : 'OBJECT';
+    if (name === 'fields') {
+      const fields = GQL_SCHEMA[type.typeName] ?? [];
+      return fields.map((entry) => ({ kind: '__Field', value: { name: entry } }));
+    }
+    if (name === 'enumValues') {
+      const values = GQL_ENUMS[type.typeName] ?? [];
+      return values.map((entry) => ({ kind: '__EnumValue', value: { name: entry } }));
+    }
+    errors.push({ message: `Field '${name}' doesn't exist on type '__Type'` });
+    return null;
+  }
+
+  if (kind === '__Field' || kind === '__EnumValue') {
+    const entry = value as { name: string };
+    if (name === '__typename') return kind;
+    if (name === 'name') return entry.name;
+    errors.push({ message: `Field '${name}' doesn't exist on type '${kind}'` });
+    return null;
+  }
+
+  if (kind === 'CreateIssuePayload') {
+    const payload = value as { issue: Issue };
+    if (name === '__typename') return kind;
+    if (name === 'issue') return { kind: 'Issue', value: payload.issue };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'CreateIssuePayload'` });
+    return null;
+  }
+
+  if (kind === 'CloseIssuePayload') {
+    const payload = value as { issue: Issue };
+    if (name === '__typename') return kind;
+    if (name === 'issue') return { kind: 'Issue', value: payload.issue };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'CloseIssuePayload'` });
+    return null;
+  }
+
+  if (kind === 'CreatePullRequestPayload') {
+    const payload = value as { pullRequest: Pull };
+    if (name === '__typename') return kind;
+    if (name === 'pullRequest') return { kind: 'PullRequest', value: payload.pullRequest };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'CreatePullRequestPayload'` });
+    return null;
+  }
+
+  if (kind === 'MergePullRequestPayload') {
+    const payload = value as { pullRequest: Pull };
+    if (name === '__typename') return kind;
+    if (name === 'pullRequest') return { kind: 'PullRequest', value: payload.pullRequest };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'MergePullRequestPayload'` });
+    return null;
+  }
+
+  if (kind === 'AddCommentPayload') {
+    const payload = value as { comment: Comment };
+    if (name === '__typename') return kind;
+    if (name === 'commentEdge') return { kind: 'IssueCommentEdge', value: payload.comment };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'AddCommentPayload'` });
+    return null;
+  }
+
+  if (kind === 'IssueCommentEdge') {
+    const comment = value as Comment;
+    if (name === '__typename') return kind;
+    if (name === 'node') return { kind: 'IssueComment', value: comment };
+    errors.push({ message: `Field '${name}' doesn't exist on type 'IssueCommentEdge'` });
+    return null;
+  }
+
+  errors.push({ message: `Unknown type '${kind}'` });
+  return null;
+}
+
+function gqlExecuteOne(document: string, variables: Record<string, unknown>): { data: Record<string, unknown> | null; errors: GqlErrorEntry[] } {
+  const errors: GqlErrorEntry[] = [];
+  let operation: GqlOperation;
+  try {
+    const parser = new GqlParser(gqlTokenize(document));
+    const operations = parser.parseDocument();
+    operation = operations[0];
+  } catch (err) {
+    return { data: null, errors: [{ message: err instanceof Error ? err.message : String(err) }] };
+  }
+  const root = operation.kind === 'mutation' ? 'Mutation' : 'Query';
+  const data = gqlSelect(root, {}, operation.selections, variables, errors);
+  return { data, errors };
+}
+
+function graphqlRoute(ctx: Ctx): void {
+  if (ctx.method !== 'POST') return message(ctx, 405, 'Method Not Allowed');
+  if (ctx.token === null) return message(ctx, 401, 'Requires authentication');
+  let payload: unknown;
+  try {
+    payload = JSON.parse(ctx.body.toString('utf8') || '{}');
+  } catch {
+    return send(ctx, 400, { message: 'Problems parsing JSON' });
+  }
+  if (Array.isArray(payload)) {
+    const out: unknown[] = [];
+    for (const entry of payload) {
+      const item = (entry ?? {}) as Record<string, unknown>;
+      const document = typeof item.query === 'string' ? item.query : '';
+      const variables = (item.variables ?? {}) as Record<string, unknown>;
+      const result = gqlExecuteOne(document, variables);
+      out.push(result.errors.length > 0 ? { data: result.data, errors: result.errors } : { data: result.data });
+    }
+    return send(ctx, 200, out);
+  }
+  const item = (payload ?? {}) as Record<string, unknown>;
+  const document = typeof item.query === 'string' ? item.query : '';
+  const variables = (item.variables ?? {}) as Record<string, unknown>;
+  const result = gqlExecuteOne(document, variables);
+  return send(ctx, 200, result.errors.length > 0 ? { data: result.data, errors: result.errors } : { data: result.data });
+}
+
 // ---------------------------------------------------------------- the server
 
 export function createApp(): Server {
@@ -1850,6 +2735,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       mcpRoute(ctx);
     } catch (err) {
       message(ctx, 500, `mcp error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+  if (ctx.path === '/api/graphql') {
+    try {
+      graphqlRoute(ctx);
+    } catch (err) {
+      message(ctx, 500, `graphql error: ${err instanceof Error ? err.message : String(err)}`);
     }
     return;
   }
