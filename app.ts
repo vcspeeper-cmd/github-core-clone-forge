@@ -346,18 +346,38 @@ function message(ctx: Ctx, status: number, text: string): void {
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', () => resolve(Buffer.concat(chunks)));
+    let single: Buffer | null = null;
+    let chunks: Buffer[] | null = null;
+    const done = (): void => {
+      if (chunks === null) resolve(single ?? EMPTY_BODY);
+      else resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks));
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (chunks === null && single === null) {
+        single = chunk;
+        return;
+      }
+      if (chunks === null) {
+        chunks = [single as Buffer];
+        single = null;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', done);
+    req.on('error', done);
   });
 }
 
 function tokenOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  const match = /^(?:Bearer|token)\s+(.+)$/i.exec(header.trim());
-  return match === null ? null : match[1].trim();
+  const text = header.trim();
+  if (text.length > 7) {
+    const scheme = text.slice(0, 7).toLowerCase();
+    if (scheme === 'bearer ') return text.slice(7).trim();
+  }
+  if (text.length > 6 && text.slice(0, 6).toLowerCase() === 'token ') return text.slice(6).trim();
+  return null;
 }
 
 function b64(data: Buffer): string {
@@ -1343,9 +1363,18 @@ function readPktLines(buf: Buffer): { packets: Pkt[]; rest: Buffer } {
   return { packets, rest: buf.subarray(i) };
 }
 
+const GIT_ADVERT_CT: Record<string, string> = {
+  'git-upload-pack': 'application/x-git-upload-pack-advertisement',
+  'git-receive-pack': 'application/x-git-receive-pack-advertisement',
+};
+const GIT_RESULT_CT: Record<string, string> = {
+  'git-upload-pack': 'application/x-git-upload-pack-result',
+  'git-receive-pack': 'application/x-git-receive-pack-result',
+};
+
 function gitAdvert(ctx: Ctx, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
   ctx.res.writeHead(200, {
-    'content-type': `application/x-${service}-advertisement`,
+    'content-type': GIT_ADVERT_CT[service],
     'cache-control': 'no-cache',
     'content-length': String(body.length),
     'x-github-request-id': ctx.requestId,
@@ -1355,7 +1384,7 @@ function gitAdvert(ctx: Ctx, service: 'git-upload-pack' | 'git-receive-pack', bo
 
 function gitResult(ctx: Ctx, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
   ctx.res.writeHead(200, {
-    'content-type': `application/x-${service}-result`,
+    'content-type': GIT_RESULT_CT[service],
     'cache-control': 'no-cache',
     'content-length': String(body.length),
     'x-github-request-id': ctx.requestId,
@@ -1397,18 +1426,20 @@ function uploadPackV0Advertisement(repo: Repo): Buffer {
   return Buffer.concat(parts);
 }
 
+const UPLOAD_PACK_V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine('agent=makeforge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function uploadPackV2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine('agent=makeforge/1.0\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return UPLOAD_PACK_V2_ADVERTISEMENT;
 }
 
 function receivePackAdvertisement(repo: Repo): Buffer {
@@ -2720,21 +2751,30 @@ function graphqlRoute(ctx: Ctx): void {
 // ---------------------------------------------------------------- the server
 
 export function createApp(): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(req, res);
-  });
+  const server = createServer(handle);
   server.keepAliveTimeout = 72_000;
   server.headersTimeout = 75_000;
   server.maxRequestsPerSocket = 0;
   return server;
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+function handle(req: IncomingMessage, res: ServerResponse): void {
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD') {
+    dispatch(req, res, EMPTY_BODY);
+    return;
+  }
+  readBody(req).then(
+    (body) => dispatch(req, res, body),
+    () => dispatch(req, res, EMPTY_BODY),
+  );
+}
+
+function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer): void {
   const rawUrl = req.url ?? '/';
   const mark = rawUrl.indexOf('?');
   const pathname = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
   const query = mark < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(mark + 1));
-  const body = req.method === 'GET' || req.method === 'HEAD' ? EMPTY_BODY : await readBody(req);
   const ctx: Ctx = {
     req,
     res,
